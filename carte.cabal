@@ -3,23 +3,21 @@
 
 name:                carte
 version:             0.1.0.0
--- synopsis:
--- description:
+synopsis:            Carte: A commandline pastebin server.
+description:         Carte allows you to host a commandline pastebin server. Just push files using netcat.
 homepage:            https://github.com/m1dnight/carte
 license:             GPL-3
 license-file:        LICENSE
 author:              Christophe De Troyer
 maintainer:          christophe.detroyer@gmail.com
--- copyright:
 category:            Network
 build-type:          Simple
--- extra-source-files:
 cabal-version:       >=1.10
-
+source-repository head
+    type:     git
+    location: https://github.com/m1dnight/carte
 executable carte
   main-is:             Main.hs
-  -- other-modules:
-  -- other-extensions:
   build-depends:       base >=4.6 && <4.10,
                        network,
                        mtl,
