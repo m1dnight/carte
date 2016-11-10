@@ -1,106 +1,156 @@
+-- Author:  Christophe De Troyer
+-- Email:   christophe.detroyer@gmail.com
+-- License: GPLv3
+-- Date:    November 10, 2016
+
 module Main where
 import           Base36
-import           Control.Concurrent
 import           Control.Monad
-import           Control.Monad.Trans.Class
+import           Control.Monad.Reader
 import           Control.Monad.Trans.State
-import           Data.Char
-import           Data.List
 import           Data.Time.Clock.POSIX
+import           Data.Tuple.Select
 import           Network
-import           System.Directory
-import           System.Environment
+import           Options.Applicative
 import           System.FilePath.Posix
 import           System.IO
 import           System.Random
-import           Text.Printf
+import           Data.Semigroup ((<>))
 
-data Data = D { rnd :: StdGen, opts :: Opts }
+ --      ___           ___           ___                         ___
+ --     /  /\         /  /\         /  /\          ___          /  /\
+ --    /  /::\       /  /::\       /  /::\        /__/\        /  /::\
+ --   /  /:/\:\     /  /:/\:\     /  /:/\:\       \  \:\      /  /:/\:\
+ --  /  /:/  \:\   /  /::\ \:\   /  /::\ \:\       \__\:\    /  /::\ \:\
+ -- /__/:/ \  \:\ /__/:/\:\_\:\ /__/:/\:\_\:\      /  /::\  /__/:/\:\ \:\
+ -- \  \:\  \__\/ \__\/  \:\/:/ \__\/~|::\/:/     /  /:/\:\ \  \:\ \:\_\/
+ --  \  \:\            \__\::/     |  |:|::/     /  /:/__\/  \  \:\ \:\
+ --   \  \:\           /  /:/      |  |:|\/     /__/:/        \  \:\_\/
+ --    \  \:\         /__/:/       |__|:|~      \__\/          \  \:\
+ --     \__\/         \__\/         \__\|                       \__\/
+
+--------------------------------------------------------------------------------
+--- ARGUMENT PARSING -----------------------------------------------------------
+--------------------------------------------------------------------------------
+
+type URL = String
+
+-- | `Configuration` is the data type that holds all the runtime
+-- information. It is populated by arguments entered by the user.
+data Configuration =
+  Configuration
+    { port  :: Integer
+    , url   :: URL
+    , files :: String
+    } deriving (Show)
+
+portParser :: Parser Integer
+portParser =
+    option auto        -- an option which reads its argument with Read
+      ( short 'p'      -- a short name i.e. "-p"
+     <> long "port"    -- a long name i.e. "--port"
+     <> metavar "PORT" -- a symbolic name in the help text
+     <> value 5001     -- a default value
+     <> help "The port on which to listen for connections" )
+
+urlParser :: Parser String
+urlParser =
+    strOption
+      ( short 'u'
+     <> long "url"
+     <> metavar "URL"
+     <> value "localhost"
+     <> help "The root url for building links to files" )
+
+filesParser :: Parser String
+filesParser =
+    strOption
+      ( short 'd'
+     <> long "dir"
+     <> metavar "DIRECTORY"
+     <> value "."
+     <> help "The DIRECTORY in which to store pastes" )
+
+configuration :: Parser Configuration
+configuration =
+    Configuration
+      <$> portParser
+      <*> urlParser
+      <*> filesParser
+
+--------------------------------------------------------------------------------
+--- MAIN -----------------------------------------------------------------------
+--------------------------------------------------------------------------------
 
 main :: IO ()
-main = do t    <- currentTimeSeconds
-          opts <- liftM buildOpts getArgs
-          putStrLn $ printf "Config: %s" (show opts)
-          withSocketsDo $
-            do s <- listenOn (PortNumber $ fromInteger . p . port $ opts)
-               evalStateT (loop s) (D (mkStdGen t) opts)
-          return ()
+main = do cfg <- execParser prog
+          socketloop cfg
+  where
+    prog = info
+      (helper <*> configuration)
+      ( fullDesc
+     <> progDesc "Start a Carte paste server"
+     <> header "Carte - a socket based paste server" )
 
-----------------------
--- Argument Parsing --
-----------------------
+--------------------------------------------------------------------------------
+--- SOCKET LOOP ----------------------------------------------------------------
+--------------------------------------------------------------------------------
 
-data Opts = Opts { port :: Arguments, host :: Arguments, files :: Arguments }
-            deriving (Show, Eq)
+-- | Starts the `loop` function which keeps on listening for client
+-- connections. The current time in seconds is used as the starting
+-- seed for the random generator.
+socketloop :: Configuration -> IO ()
+socketloop cfg = withSocketsDo $ do
+                   seed <- fmap mkStdGen currentTimeSeconds
+                   s    <- listenOn (PortNumber . fromInteger . port $ cfg)
+                   runReaderT (evalStateT (loop s) seed) cfg
 
-data Arguments
- = Port     { p :: Integer }
- | HostName { h :: String  }
- | FileDir  { dir :: String  }
- deriving (Show, Eq)
+-- | Fires a new thread for each client connection, handles the rest
+-- of the upload.
+loop :: Socket -> StateT StdGen (ReaderT Configuration IO) ()
+loop s = liftIO (accept s) >>= handleUploader . sel1  >> loop s
 
-parseArg as arg constr process  deflt =
-  let args = take 2 . dropWhile (/= arg) $ as
-  in
-    case args of
-      [arg, opts] -> constr (process opts)
-      _           -> constr deflt
+--------------------------------------------------------------------------------
+--- UPLOADER HANDLING ----------------------------------------------------------
+--------------------------------------------------------------------------------
 
-parsePort as    = parseArg as "-p" Port read 5001
-parseHost as    = parseArg as "-h" HostName id "localhost"
-parseFileDir as = parseArg as "-d" FileDir id "."
+-- | Takes in a `Handle` (socket), reads the input from the socket,
+-- writes it to disk, notifies the user and closes the socket.
+handleUploader :: Handle -> StateT StdGen (ReaderT Configuration IO) ()
+handleUploader source = do
+  key     <- newKey
+  baseUrl <- asks url
+  fileDir <- asks files
+  void . liftIO $ do
+    receiveFile source (fileDir </> key)
+    notify source (baseUrl </> key)
+    hClose source
 
-buildOpts args = Opts { port  = parsePort args,
-                        host  = parseHost args,
-                        files = parseFileDir args }
+-- | Writes data from first `Handle` to second `Handle` until EOF
+-- is encountered. The `Handle`s are not closed.
+pipe :: Handle -> Handle -> IO ()
+pipe src sink = do
+  l   <- hGetLine src
+  hPutStrLn sink l
+  end <- hIsEOF src
+  unless end $ pipe src sink
 
-buildFileUrl url id = if last url == '/'
-                         then url ++ id
-                         else url ++ "/" ++ id
+-- | Takes in a `Handle` and writes all the data to the given file at
+-- FilePath. Uses `WriteMode` so overwrites any contents.
+receiveFile :: Handle -> FilePath -> IO ()
+receiveFile src filepath = withBinaryFile filepath WriteMode (pipe src)
 
----------------------
--- Socket handling --
----------------------
+-- | Prints the web URL on the socket (to the user).
+notify :: Handle -> URL -> IO ()
+notify = hPutStrLn
 
-loop :: Socket -> StateT Data IO ()
-loop s =
-  do (h,_,_) <- lift $ accept s
-     id      <- randId
-     conf    <- liftM opts get
-     lift . forkIO $ process h id conf
-     loop s
-
-process :: Handle -> String -> Opts -> IO ()
-process hdl id opts = do d <- eatData hdl []
-                         let filepath = combine (dir . files $ opts) id
-                         saveToDisk filepath d
-                         hPutStrLn hdl $ buildFileUrl (h . host $ opts) id
-                         hFlush hdl
-                         hClose hdl
-
-
-eatData :: Handle -> [String] -> IO [String]
-eatData handle ls =
-  do l <- hGetLine handle
-     end <- hIsEOF handle
-     if end
-       then return $ l:ls
-       else eatData handle $ l:ls
-
-saveToDisk :: FilePath -> [String] -> IO ()
-saveToDisk fp ls = do path <- canonicalizePath fp
-                      putStrLn $ printf "Writing file to %s" path
-                      writeFile path (intercalate "\n" ls)
-
---------------------------
--- Random ID generation --
---------------------------
-
-randId :: StateT Data IO String
-randId = do d <- get
-            let (str, gen') = random (rnd d)
-            put (d { rnd = gen' })
-            return $ base36 str
-
+-- | Returns the current time in seconds. Used as a seed for the random generator.
 currentTimeSeconds :: IO Int
-currentTimeSeconds = round `fmap` getPOSIXTime
+currentTimeSeconds = round <$> getPOSIXTime
+
+-- | Generates a new random ID for the snippet.
+newKey :: (Monad m) => StateT StdGen m String
+newKey = do
+  (key, gen') <- gets random
+  put gen'
+  return $ base36 key

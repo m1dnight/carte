@@ -1,0 +1,16 @@
+[Service]
+WorkingDirectory=/opt/carte/dist/build/carte
+ExecStart=/opt/carte/dist/build/carte/carte -d /var/www/ssl/files -p 9999 -h call-cc.be/files
+Restart=always
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=carte
+User=carte
+Group=carte
+
+[Install]
+WantedBy=multi-user.target
+
+[Unit]
+Wants=network-online.target
+After=network.target network-online.target

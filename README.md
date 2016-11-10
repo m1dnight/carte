@@ -7,6 +7,22 @@ It is fully functional in the sense that it does what it is supposed
 to do. You just pipe some text to a netcat connection and you get back
 a link to a paste.
 
+## Building
+
+The usual.
+
+```
+git clone https://github.com/m1dnight/carte
+cd carte
+cabal update
+cabal sandbox init
+cabal configure
+cabal install
+cabal build
+```
+
+## Example Usage
+
 ### Client
 
 ```
